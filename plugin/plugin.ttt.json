@@ -1,0 +1,23 @@
+{
+  "name": "ttt-mcp",
+  "version": "0.1.0",
+  "description": "Discover and control running ttt editors through MCP.",
+  "entry": "init.lua",
+  "permissions": {
+    "commands": true,
+    "editor.read": true,
+    "editor.write": true,
+    "input": true,
+    "screen.read": true,
+    "clipboard.read": true,
+    "terminal.control": true,
+    "terminal.read": true,
+    "system.exec": ["ttt-mcp"],
+    "system.env": true,
+    "network.rpc": ["unix:~/.cache/ttt-mcp/hub.sock", "127.0.0.1:4251"],
+    "events.file": true,
+    "events.editor": true,
+    "fs.read": ["{workspace}"],
+    "fs.write": ["{workspace}"]
+  }
+}

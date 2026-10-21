@@ -1,0 +1,758 @@
+diff --git a/cmd/ttt/main.go b/cmd/ttt/main.go
+index fb45df17..6f10120f 100644
+--- a/cmd/ttt/main.go
++++ b/cmd/ttt/main.go
+@@ -335,9 +335,9 @@ Docs: https://tttedit.dev
+ 			p.RequestRedraw = func() {
+ 				screen.PostEvent(tcell.NewEventInterrupt(nil))
+ 			}
+-			p.PostAsync = func(result *plugin.PluginAsyncResult) {
++			p.SetPostAsync(func(result *plugin.PluginAsyncResult) {
+ 				screen.PostEvent(tcell.NewEventInterrupt(result))
+-			}
++			})
+ 		}
+ 		editor.RegisterStartupPluginCommands()
+ 
+diff --git a/docs-web/src/content/docs/guides/plugin-authoring.md b/docs-web/src/content/docs/guides/plugin-authoring.md
+index 6193bcb7..1e982c0c 100644
+--- a/docs-web/src/content/docs/guides/plugin-authoring.md
++++ b/docs-web/src/content/docs/guides/plugin-authoring.md
+@@ -2553,6 +2553,38 @@ rpc.connect("unix:~/.cache/my-hub.sock", {
+ end)
+ ```
+ 
++## Automation API
++
++`ttt.automation` provides acknowledged actions for companion processes. Call `automation.run(action, args, callback)` on the UI thread. It returns a cancellation function; `callback(result, err)` runs on the main thread after the action has been handled and redrawn. Unloading the plugin cancels outstanding automation. Already-applied changes remain available to normal undo.
++
++```lua
++local automation = require("ttt.automation")
++local cancel = automation.run("paste", "hello\nworld", function(result, err)
++  if err then ttt.log("error", err) end
++end)
++```
++
++| Action | Permission | Arguments / result |
++|--------|------------|--------------------|
++| `session` | `editor.read` | No arguments; returns PID, workspace paths, active file and ttt version. |
++| `buffer` | `editor.read` | No arguments; returns path, complete text and one-based cursor. |
++| `screenshot` | `screen.read` | No arguments; returns the screen text. |
++| `debug` | `screen.read`, `editor.read`, `terminal.read` | No arguments; returns the structured debug state, which includes buffer text and terminal history. |
++| `commands` | `commands` | No arguments; returns command IDs and titles. |
++| `command`, `exec` | `commands` | Command ID or exact command title. |
++| `open` | `commands` | JSON object string with `path`, optional one-based `line` and `readonly`. |
++| `panel`, `copy` | `commands` | Bottom panel ID, or no arguments for copy. |
++| `clipboard` | `clipboard.read` | No arguments; returns clipboard text. |
++| `click`, `rclick`, `hover` | `input` | `x y`, in zero-based screen cells. |
++| `drag` | `input` | `x1 y1 x2 y2`. |
++| `scroll` | `input` | `x y signed-count`, positive down; maximum magnitude 1000. |
++| `key` | `input` | Key combination or chord, as in keybindings. |
++| `type`, `paste` | `input` | Literal text; paste uses the editor's undoable paste path. |
++| `wait` | `input` | Milliseconds, at most 30000. |
++| `wait-for` | `screen.read` | Screen text and optional `timeout=MS`, as in `--exec`; at most 30000 ms, default 5000. |
++
++Call `cancel()` to stop waiting and prevent queued events from applying. Claimed events finish handling before cancellation returns through the callback. Actions fail while plugin permission approvals are pending; synthesized input cannot approve permissions. Commands may start external work that continues after their acknowledgment; use `wait-for` or inspect state to observe its completion.
++
+ ## Events API
+ 
+ The `ttt.events` module lets plugins react to editor lifecycle events.
+diff --git a/internal/app/commands_plugin.go b/internal/app/commands_plugin.go
+index a6e47e41..8a745e5d 100644
+--- a/internal/app/commands_plugin.go
++++ b/internal/app/commands_plugin.go
+@@ -1,6 +1,7 @@
+ package app
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"log/slog"
+@@ -477,9 +478,9 @@ func (a *App) WirePlugin(p *plugin.Plugin) {
+ 		}
+ 		return result
+ 	}
+-	p.PostAsync = func(result *plugin.PluginAsyncResult) {
++	p.SetPostAsync(func(result *plugin.PluginAsyncResult) {
+ 		a.Screen.PostEvent(tcell.NewEventInterrupt(result))
+-	}
++	})
+ 	pluginSource := "plugin:" + p.Name
+ 	p.PublishDiagnostics = func(path string, items []plugin.DiagnosticItem) {
+ 		diags := make([]ui.Diagnostic, 0, len(items))
+@@ -582,6 +583,9 @@ func (a *App) WirePlugin(p *plugin.Plugin) {
+ 	}
+ 	p.Filesystem = fs
+ 	p.DialRPC = dialPluginRPC(fs.vars)
++	p.RunAutomation = func(ctx context.Context, action, args string) (json.RawMessage, error) {
++		return a.runPluginAutomation(ctx, p, action, args)
++	}
+ 	p.System = NewPluginSystemAPI()
+ 	p.Terminal = NewPluginTerminalAPI(a)
+ 	if system, ok := p.System.(*PluginSystemAPI); ok {
+@@ -1164,7 +1168,9 @@ func closePluginPanel(w ui.Widget) {
+ // pluginInput is input a plugin synthesized. The event loop drops it while a
+ // plugin approval dialog is open, so no plugin can grant permissions.
+ type pluginInput struct {
+-	Events []tcell.Event
++	Events    []tcell.Event
++	Lifecycle *execRequestLifecycle
++	Allowed   func() bool
+ }
+ 
+ // postPluginInput sends events as one interrupt: PostEvent falls back to a
+diff --git a/internal/app/eventloop.go b/internal/app/eventloop.go
+index 9872c75a..492651cb 100644
+--- a/internal/app/eventloop.go
++++ b/internal/app/eventloop.go
+@@ -302,8 +302,13 @@ func RunEventLoop(
+ 					execRequest = v.Lifecycle
+ 				}
+ 			case *pluginInput:
++				if v.Lifecycle != nil && !v.Lifecycle.claim() {
++					break
++				}
++				execRequest = v.Lifecycle
+ 				for _, ev := range v.Events {
+-					if !app.acceptsPluginInput() {
++					if !app.acceptsPluginInput() || (v.Allowed != nil && !v.Allowed()) {
++						execErr = failedExec("plugin input unavailable while permissions are pending or plugin is unloaded")
+ 						break
+ 					}
+ 					switch event := ev.(type) {
+diff --git a/internal/app/exec_script.go b/internal/app/exec_script.go
+index 50df0a43..12e4182c 100644
+--- a/internal/app/exec_script.go
++++ b/internal/app/exec_script.go
+@@ -511,21 +511,28 @@ func execPanel(a *App, args string) error {
+ 		return invalidExec("panel requires a panel ID")
+ 	}
+ 	return runExecMain(a, func() error {
+-		if !a.BottomPanel.HasPanel(id) {
++		if !a.focusBottomPanel(id) {
+ 			return invalidExec("panel %q not found", id)
+ 		}
+-		a.BottomPanel.SetActivePanel(id)
+-		if !a.ContentSplit.ShowBottom {
+-			a.ensureUsablePanelSize()
+-			a.ContentSplit.ShowBottom = true
+-		}
+-		if w := a.BottomPanel.ActiveWidget(); w != nil {
+-			a.Root.SetFocus(w)
+-		}
+ 		return nil
+ 	})
+ }
+ 
++func (a *App) focusBottomPanel(id string) bool {
++	if !a.BottomPanel.HasPanel(id) {
++		return false
++	}
++	a.BottomPanel.SetActivePanel(id)
++	if !a.ContentSplit.ShowBottom {
++		a.ensureUsablePanelSize()
++		a.ContentSplit.ShowBottom = true
++	}
++	if w := a.BottomPanel.ActiveWidget(); w != nil {
++		a.Root.SetFocus(w)
++	}
++	return true
++}
++
+ func postExecInput(a *App, event tcell.Event) error {
+ 	return postExecInputTimeout(a, event, execRequestTimeout)
+ }
+diff --git a/internal/app/plugin_automation.go b/internal/app/plugin_automation.go
+new file mode 100644
+index 00000000..54bee61a
+--- /dev/null
++++ b/internal/app/plugin_automation.go
+@@ -0,0 +1,250 @@
++package app
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"os"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/eugenioenko/ttt/internal/config"
++	"github.com/eugenioenko/ttt/internal/plugin"
++	"github.com/gdamore/tcell/v3"
++)
++
++func awaitPluginAction(ctx context.Context, lifecycle *execRequestLifecycle) error {
++	ctx, cancel := context.WithTimeout(ctx, execRequestTimeout)
++	defer cancel()
++	select {
++	case err := <-lifecycle.done:
++		return err
++	case <-ctx.Done():
++		if lifecycle.cancel() {
++			return ctx.Err()
++		}
++		return <-lifecycle.done
++	}
++}
++
++func (a *App) runPluginAutomation(ctx context.Context, p *plugin.Plugin, action, args string) (json.RawMessage, error) {
++	allowed := func() bool { return p.Enabled && p.State != nil }
++	post := func(event tcell.Event) error {
++		if err := ctx.Err(); err != nil {
++			return err
++		}
++		lifecycle := newExecRequestLifecycle()
++		if err := a.Screen.PostEvent(tcell.NewEventInterrupt(&pluginInput{Events: []tcell.Event{event}, Lifecycle: lifecycle, Allowed: allowed})); err != nil {
++			return err
++		}
++		return awaitPluginAction(ctx, lifecycle)
++	}
++	var result any = map[string]any{"ok": true}
++	var encoded json.RawMessage
++	main := func(fn func() error) error {
++		if err := ctx.Err(); err != nil {
++			return err
++		}
++		lifecycle := newExecRequestLifecycle()
++		err := a.Screen.PostEvent(tcell.NewEventInterrupt(&execMainRequest{Lifecycle: lifecycle, Run: func() error {
++			if err := ctx.Err(); err != nil {
++				return err
++			}
++			if !allowed() || !a.acceptsPluginInput() {
++				return fmt.Errorf("automation unavailable while permissions are pending or plugin is unloaded")
++			}
++			if err := fn(); err != nil {
++				return err
++			}
++			var err error
++			encoded, err = json.Marshal(result)
++			return err
++		}}))
++		if err != nil {
++			return err
++		}
++		return awaitPluginAction(ctx, lifecycle)
++	}
++	var err error
++	switch action {
++	case "click", "rclick", "hover", "drag":
++		count := 2
++		if action == "drag" {
++			count = 4
++		}
++		x, y, parseErr := parseCoordinates(action, args, count)
++		if parseErr != nil {
++			return nil, parseErr
++		}
++		button := tcell.Button1
++		if action == "rclick" {
++			button = tcell.Button2
++		}
++		if action == "hover" {
++			button = tcell.ButtonNone
++		}
++		err = post(tcell.NewEventMouse(x[0], y[0], button, tcell.ModNone))
++		if action == "drag" {
++			for i := 1; i <= 10 && err == nil; i++ {
++				err = post(tcell.NewEventMouse(x[0]+(x[1]-x[0])*i/10, y[0]+(y[1]-y[0])*i/10, button, tcell.ModNone))
++			}
++		}
++		if err == nil && action != "hover" {
++			end := 0
++			if action == "drag" {
++				end = 1
++			}
++			err = post(tcell.NewEventMouse(x[end], y[end], tcell.ButtonNone, tcell.ModNone))
++		}
++	case "key":
++		steps, parseErr := config.ParseKeyString(args)
++		if parseErr != nil {
++			return nil, parseErr
++		}
++		for _, step := range steps {
++			key, mod, ch := comboToTcell(step)
++			err = post(tcell.NewEventKey(key, keyEventStr(ch), mod))
++			if err != nil {
++				break
++			}
++		}
++	case "type":
++		for _, r := range args {
++			err = post(tcell.NewEventKey(tcell.KeyRune, string(r), tcell.ModNone))
++			if err != nil {
++				break
++			}
++		}
++	case "scroll":
++		parts := strings.Fields(args)
++		if len(parts) != 3 {
++			return nil, fmt.Errorf("scroll requires x y signed-count")
++		}
++		x, e1 := strconv.Atoi(parts[0])
++		y, e2 := strconv.Atoi(parts[1])
++		n, e3 := strconv.Atoi(parts[2])
++		if e1 != nil || e2 != nil || e3 != nil || n < -1000 || n > 1000 {
++			return nil, fmt.Errorf("invalid scroll coordinates or count (maximum 1000)")
++		}
++		button := tcell.WheelDown
++		if n < 0 {
++			button = tcell.WheelUp
++			n = -n
++		}
++		for i := 0; i < n; i++ {
++			err = post(tcell.NewEventMouse(x, y, button, tcell.ModNone))
++			if err != nil {
++				break
++			}
++		}
++	case "wait":
++		var duration time.Duration
++		duration, err = parseExecMilliseconds(args, true)
++		if err == nil {
++			if duration > 30*time.Second {
++				return nil, fmt.Errorf("wait cannot exceed 30000 ms")
++			}
++			timer := time.NewTimer(duration)
++			defer timer.Stop()
++			select {
++			case <-timer.C:
++			case <-ctx.Done():
++				err = ctx.Err()
++			}
++		}
++	case "wait-for":
++		text, timeout, parseErr := parseWaitForArgs(args)
++		if parseErr != nil {
++			return nil, parseErr
++		}
++		if timeout > 30*time.Second {
++			return nil, fmt.Errorf("wait-for cannot exceed 30000 ms")
++		}
++		deadline := time.Now().Add(timeout)
++		for {
++			found := false
++			err = main(func() error { found = strings.Contains(a.Screenshot(), text); return nil })
++			if err != nil || found {
++				break
++			}
++			if time.Now().After(deadline) {
++				err = fmt.Errorf("timed out waiting for %q", args)
++				break
++			}
++			timer := time.NewTimer(25 * time.Millisecond)
++			select {
++			case <-timer.C:
++			case <-ctx.Done():
++				timer.Stop()
++				return nil, ctx.Err()
++			}
++		}
++	default:
++		err = main(func() error {
++			switch action {
++			case "session":
++				result = map[string]any{"pid": os.Getpid(), "workspaces": a.Workspace.Paths(), "active_file": a.EditorGroup.ActiveFilePath(), "version": a.Version}
++			case "screenshot":
++				result = a.Screenshot()
++			case "debug":
++				result = a.BuildDebugState()
++			case "buffer":
++				result = map[string]any{"path": p.Editor.FilePath(), "text": p.Editor.BufferText(), "cursor": func() any { l, c := p.Editor.CursorPos(); return map[string]int{"line": l + 1, "col": c + 1} }()}
++			case "commands":
++				commands := make([]map[string]string, 0)
++				for _, cmd := range p.ListCommands() {
++					commands = append(commands, map[string]string{"id": cmd.ID, "title": cmd.Title})
++				}
++				result = commands
++			case "command", "exec":
++				id := args
++				if action == "exec" {
++					cmd, ok := a.Reg.FindByTitle(args)
++					if !ok {
++						return fmt.Errorf("unknown command title %q", args)
++					}
++					id = cmd.ID
++				}
++				if !a.Reg.Execute(id) {
++					return fmt.Errorf("unknown command %q", id)
++				}
++				a.FlushEditorOnChange()
++			case "paste":
++				a.PasteText(args)
++				a.FlushEditorOnChange()
++			case "copy":
++				a.Copy()
++			case "clipboard":
++				result = p.ClipboardRead()
++			case "open":
++				var spec struct {
++					Path     string `json:"path"`
++					Line     int    `json:"line"`
++					Readonly bool   `json:"readonly"`
++				}
++				if err := json.Unmarshal([]byte(args), &spec); err != nil {
++					return err
++				}
++				if spec.Path == "" {
++					return fmt.Errorf("open requires path")
++				}
++				p.OpenFile(spec.Path, spec.Line, spec.Readonly)
++			case "panel":
++				if !a.focusBottomPanel(args) {
++					return fmt.Errorf("unknown panel %q", args)
++				}
++			default:
++				return fmt.Errorf("unknown automation action %q", action)
++			}
++			return nil
++		})
++	}
++	if err != nil {
++		return nil, err
++	}
++	if encoded != nil {
++		return encoded, nil
++	}
++	return json.Marshal(result)
++}
+diff --git a/internal/app/plugin_automation_test.go b/internal/app/plugin_automation_test.go
+new file mode 100644
+index 00000000..597efc19
+--- /dev/null
++++ b/internal/app/plugin_automation_test.go
+@@ -0,0 +1,68 @@
++package app
++
++import (
++	"context"
++	"encoding/json"
++	"strings"
++	"testing"
++
++	"github.com/eugenioenko/ttt/internal/plugin"
++	lua "github.com/yuin/gopher-lua"
++)
++
++func automationTestPlugin(t *testing.T, a *App) *plugin.Plugin {
++	t.Helper()
++	p := &plugin.Plugin{Enabled: true, State: lua.NewState()}
++	t.Cleanup(func() { p.State.Close() })
++	p.Editor = NewPluginEditorAPI(a)
++	return p
++}
++
++func TestPluginAutomationAcknowledgesPasteAndUndo(t *testing.T) {
++	a := newListenTestApp(t)
++	p := automationTestPlugin(t, a)
++	if _, err := a.runPluginAutomation(context.Background(), p, "paste", "héllo\n世界"); err != nil {
++		t.Fatal(err)
++	}
++	raw, err := a.runPluginAutomation(context.Background(), p, "buffer", "")
++	if err != nil {
++		t.Fatal(err)
++	}
++	var result struct {
++		Text string `json:"text"`
++	}
++	if err := json.Unmarshal(raw, &result); err != nil {
++		t.Fatal(err)
++	}
++	if result.Text != "héllo\n世界" {
++		t.Fatalf("buffer=%q", result.Text)
++	}
++	if _, err := a.runPluginAutomation(context.Background(), p, "command", "editor.undo"); err != nil {
++		t.Fatal(err)
++	}
++	raw, err = a.runPluginAutomation(context.Background(), p, "buffer", "")
++	if err != nil {
++		t.Fatal(err)
++	}
++	_ = json.Unmarshal(raw, &result)
++	if result.Text != "" {
++		t.Fatalf("undo left %q", result.Text)
++	}
++}
++
++func TestPluginAutomationCannotActDuringApproval(t *testing.T) {
++	a := newListenTestApp(t)
++	p := automationTestPlugin(t, a)
++	if err := runExecMain(a, func() error { a.PendingPluginApprovals = []*plugin.Plugin{{Name: "pending"}}; return nil }); err != nil {
++		t.Fatal(err)
++	}
++	for _, action := range []string{"type", "paste", "command", "rclick", "hover"} {
++		args := "hello"
++		if action == "rclick" || action == "hover" {
++			args = "2 2"
++		}
++		if _, err := a.runPluginAutomation(context.Background(), p, action, args); err == nil || !strings.Contains(err.Error(), "permissions are pending") {
++			t.Fatalf("%s: %v", action, err)
++		}
++	}
++}
+diff --git a/internal/plugin/lua_automation.go b/internal/plugin/lua_automation.go
+new file mode 100644
+index 00000000..12e4c129
+--- /dev/null
++++ b/internal/plugin/lua_automation.go
+@@ -0,0 +1,70 @@
++package plugin
++
++import (
++	"context"
++	"encoding/json"
++	"time"
++
++	lua "github.com/yuin/gopher-lua"
++)
++
++func setupAutomationModule(L *lua.LState, p *Plugin) {
++	L.PreloadModule("ttt.automation", func(L *lua.LState) int {
++		mod := L.NewTable()
++		L.SetField(mod, "run", L.NewFunction(func(L *lua.LState) int {
++			action, args, callback := L.CheckString(1), L.CheckString(2), L.CheckFunction(3)
++			for _, permission := range automationPermissions(action) {
++				if err := p.Granted.Check(permission); err != nil {
++					L.RaiseError("%s", err.Error())
++					return 0
++				}
++			}
++			run := p.RunAutomation
++			if run == nil {
++				L.RaiseError("automation API not available")
++				return 0
++			}
++			ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
++			id := p.registerTimer(cancel)
++			go func() {
++				defer cancel()
++				result, err := run(ctx, action, args)
++				p.SafePostAsync(&PluginAsyncResult{Plugin: p, Callback: func() {
++					p.ClearTimer(id)
++					if p.State == nil {
++						return
++					}
++					if err != nil {
++						_ = p.CallLuaFunc(callback, lua.LNil, lua.LString(err.Error()))
++						return
++					}
++					var value any
++					_ = json.Unmarshal(result, &value)
++					_ = p.CallLuaFunc(callback, goToLua(p.State, value), lua.LNil)
++				}})
++			}()
++			L.Push(L.NewFunction(func(L *lua.LState) int { cancel(); return 0 }))
++			return 1
++		}))
++		L.Push(mod)
++		return 1
++	})
++}
++
++// automationPermissions lists what an action needs. The debug dump includes
++// buffer text and terminal history, so it needs their read permissions too.
++func automationPermissions(action string) []string {
++	switch action {
++	case "session", "buffer":
++		return []string{"editor.read"}
++	case "screenshot", "wait-for":
++		return []string{"screen.read"}
++	case "debug":
++		return []string{"screen.read", "editor.read", "terminal.read"}
++	case "commands", "exec", "command", "panel", "copy", "open":
++		return []string{"commands"}
++	case "clipboard":
++		return []string{"clipboard.read"}
++	}
++	return []string{"input"}
++}
+diff --git a/internal/plugin/lua_automation_test.go b/internal/plugin/lua_automation_test.go
+new file mode 100644
+index 00000000..e4f825f2
+--- /dev/null
++++ b/internal/plugin/lua_automation_test.go
+@@ -0,0 +1,100 @@
++package plugin
++
++import (
++	"context"
++	"encoding/json"
++	"strings"
++	"testing"
++	"time"
++
++	lua "github.com/yuin/gopher-lua"
++)
++
++func TestAutomationChecksActionPermissions(t *testing.T) {
++	p, cleanup := newTestPluginBase(PermissionSet{})
++	defer cleanup()
++	for _, action := range []string{"type", "paste", "screenshot", "debug", "session", "buffer", "commands", "command", "clipboard"} {
++		err := p.State.DoString(`require("ttt.automation").run("` + action + `", "", function() end)`)
++		if err == nil || !strings.Contains(err.Error(), "permission denied") {
++			t.Fatalf("%s: %v", action, err)
++		}
++	}
++}
++
++func TestAutomationCancellationAndUnload(t *testing.T) {
++	for _, unload := range []bool{false, true} {
++		p, _ := newTestPluginBase(PermissionSet{Input: true})
++		posted := make(chan *PluginAsyncResult, 1)
++		p.SetPostAsync(func(r *PluginAsyncResult) { posted <- r })
++		started, cancelled := make(chan struct{}), make(chan struct{})
++		p.RunAutomation = func(ctx context.Context, _, _ string) (json.RawMessage, error) {
++			close(started)
++			<-ctx.Done()
++			close(cancelled)
++			return nil, ctx.Err()
++		}
++		if err := p.State.DoString(`cancel = require("ttt.automation").run("wait", "30000", function(result, err) failure = err end)`); err != nil {
++			t.Fatal(err)
++		}
++		<-started
++		if unload {
++			p.Destroy()
++		} else if err := p.State.DoString(`cancel()`); err != nil {
++			t.Fatal(err)
++		}
++		select {
++		case <-cancelled:
++		case <-time.After(time.Second):
++			t.Fatal("automation did not cancel")
++		}
++		if !unload {
++			select {
++			case r := <-posted:
++				r.Callback()
++			case <-time.After(time.Second):
++				t.Fatal("cancellation callback not posted")
++			}
++			if !strings.Contains(p.State.GetGlobal("failure").String(), context.Canceled.Error()) {
++				t.Fatal("missing cancellation error")
++			}
++			p.Destroy()
++		}
++	}
++}
++
++func TestAutomationPostsResultOnMainThread(t *testing.T) {
++	p, cleanup := newTestPluginBase(PermissionSet{Input: true})
++	defer cleanup()
++	posted := make(chan *PluginAsyncResult, 1)
++	p.PostAsync = func(r *PluginAsyncResult) { posted <- r }
++	p.RunAutomation = func(_ context.Context, action, args string) (json.RawMessage, error) {
++		if action != "type" || args != "世界" {
++			t.Errorf("action=%q args=%q", action, args)
++		}
++		return json.RawMessage(`{"ok":true}`), nil
++	}
++	if err := p.State.DoString(`require("ttt.automation").run("type", "世界", function(result, err) done = result.ok; failure = err end)`); err != nil {
++		t.Fatal(err)
++	}
++	if p.State.GetGlobal("done") != lua.LNil {
++		t.Fatal("callback ran before main-thread delivery")
++	}
++	select {
++	case r := <-posted:
++		r.Callback()
++	case <-time.After(time.Second):
++		t.Fatal("callback not posted")
++	}
++	if p.State.GetGlobal("done") != lua.LTrue || p.State.GetGlobal("failure") != lua.LNil {
++		t.Fatal("callback did not receive result")
++	}
++}
++
++func TestAutomationDebugNeedsEditorAndTerminalRead(t *testing.T) {
++	p, cleanup := newTestPluginBase(PermissionSet{ScreenRead: true})
++	defer cleanup()
++	err := p.State.DoString(`require("ttt.automation").run("debug", "", function() end)`)
++	if err == nil || !strings.Contains(err.Error(), "editor.read") {
++		t.Fatalf("debug with screen.read only: %v", err)
++	}
++}
+diff --git a/internal/plugin/plugin.go b/internal/plugin/plugin.go
+index 24a3a6c0..141c7758 100644
+--- a/internal/plugin/plugin.go
++++ b/internal/plugin/plugin.go
+@@ -2,6 +2,7 @@ package plugin
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"fmt"
+ 	"io"
+ 	"log/slog"
+@@ -94,6 +95,7 @@ type Plugin struct {
+ 	SimulateKeys       func(combo string) error
+ 	SimulateText       func(text string)
+ 	DialRPC            func(ctx context.Context, endpoint string) (io.ReadWriteCloser, error)
++	RunAutomation      func(ctx context.Context, action, args string) (json.RawMessage, error)
+ 	ScreenText         func() string
+ 	DebugState         func() (string, error)
+ 	QuitApp            func()
+@@ -177,6 +179,7 @@ func (p *Plugin) Init() error {
+ 	setupTerminalModule(p.State, p)
+ 	setupNetModule(p.State, p)
+ 	setupRPCModule(p.State, p)
++	setupAutomationModule(p.State, p)
+ 	setupEventsModule(p.State, p)
+ 	setupJSONModule(p.State)
+ 	setupRegexModule(p.State)
+@@ -226,6 +229,7 @@ func (p *Plugin) InitFromSource(source string) error {
+ 	setupTerminalModule(p.State, p)
+ 	setupNetModule(p.State, p)
+ 	setupRPCModule(p.State, p)
++	setupAutomationModule(p.State, p)
+ 	setupEventsModule(p.State, p)
+ 	setupJSONModule(p.State)
+ 	setupRegexModule(p.State)
+@@ -260,6 +264,12 @@ func (p *Plugin) logError(context string, err error) {
+ 	}
+ }
+ 
++func (p *Plugin) SetPostAsync(post func(*PluginAsyncResult)) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	p.PostAsync = post
++}
++
+ func (p *Plugin) SafePostAsync(result *PluginAsyncResult) {
+ 	p.mu.Lock()
+ 	defer p.mu.Unlock()
+@@ -315,6 +325,7 @@ func (p *Plugin) Destroy() {
+ 	p.SimulateKeys = nil
+ 	p.SimulateText = nil
+ 	p.DialRPC = nil
++	p.RunAutomation = nil
+ 	p.ScreenText = nil
+ 	p.DebugState = nil
+ 	p.QuitApp = nil
+diff --git a/internal/plugin/sandbox.go b/internal/plugin/sandbox.go
+index 13bb6c4d..2b4cdaa6 100644
+--- a/internal/plugin/sandbox.go
++++ b/internal/plugin/sandbox.go
+@@ -760,6 +760,7 @@ func setupTTTModule(L *lua.LState, p *Plugin) {
+ 		"ttt.terminal":    true,
+ 		"ttt.net":         true,
+ 		"ttt.rpc":         true,
++		"ttt.automation":  true,
+ 		"ttt.events":      true,
+ 		"ttt.json":        true,
+ 		"ttt.regex":       true,
+diff --git a/internal/plugin/test_helpers_test.go b/internal/plugin/test_helpers_test.go
+index e47a5ea4..d5bbc42f 100644
+--- a/internal/plugin/test_helpers_test.go
++++ b/internal/plugin/test_helpers_test.go
+@@ -21,6 +21,7 @@ func newTestPluginBase(perms PermissionSet) (*Plugin, func()) {
+ 	setupTerminalModule(L, p)
+ 	setupNetModule(L, p)
+ 	setupRPCModule(L, p)
++	setupAutomationModule(L, p)
+ 	setupEventsModule(L, p)
+ 	return p, func() { L.Close() }
+ }
