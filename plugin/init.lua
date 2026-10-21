@@ -9,7 +9,10 @@ local automation = require("ttt.automation")
 local conn, connecting, stopped = nil, false, false
 local pending = {}
 local generation = 0
-local modules = { ttt = ttt, ["ttt.editor"] = require("ttt.editor"), ["ttt.terminal"] = require("ttt.terminal") }
+local modules = {
+  ttt = ttt, ["ttt.editor"] = require("ttt.editor"), ["ttt.terminal"] = require("ttt.terminal"),
+  ["ttt.decorations"] = require("ttt.decorations"),
+}
 local signatures = {
   ["ttt.editor"] = {
     buffer_text = "() -> string", buffer_lines = "() -> string[]", current_line = "() -> string",
@@ -28,8 +31,11 @@ local signatures = {
     focus = "(id) -> ok, err", close = "(id) -> ok, err", read = "(id, max_bytes?) -> text, err",
     screen = "(id) -> table, err", list = "() -> table[]",
   },
+  ["ttt.decorations"] = {
+    set = "(path, {line, end_line?, col?, end_col?, style?, note?}[])", clear = "(path?)",
+  },
   ttt = {
-    version = "() -> string", platform = "() -> string", arch = "() -> string", graphics = "() -> table",
+    version ="() -> string", platform = "() -> string", arch = "() -> string", graphics = "() -> table",
     plugin_dir = "() -> string", open_file = "(path, line?, readonly?)", exec_command = "(id) -> bool",
     list_commands = "() -> {id, title}[]", clipboard_read = "() -> string", clipboard_write = "(text)",
     screenshot = "(path?) -> text", debug = "(path?) -> JSON string", notify = "(message, level?)",
