@@ -16,7 +16,7 @@ The first plugin starts the shared service. Other editors join it. Every editor 
 
 ## Requirements
 
-**v0.1.0 requires unreleased ttt plugin APIs: `ttt.rpc` and `ttt.automation`. ttt v1.8.0 is not compatible.** Use a development build containing both APIs, or follow [Building a compatible ttt](#building-a-compatible-ttt). Installing a prebuilt ttt-mcp binary does not require Go.
+**Requires ttt v1.9.0 or newer**, which provides the `ttt.rpc` and `ttt.automation` plugin APIs. Earlier releases, including v1.8.0, are not compatible. Installing a prebuilt ttt-mcp binary does not require Go.
 
 The automation API supplies mouse/paste actions, session metadata, and completion acknowledgments after handling and redraw. It also cancels queued work and refuses actions while plugin approvals are pending. It does not enable the editor's HTTP listener.
 
@@ -25,8 +25,8 @@ The automation API supplies mouse/paste actions, session metadata, and completio
 On Linux or macOS, download and run the installer:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/eugenioenko/ttt-mcp/v0.1.0/install.sh -o /tmp/install-ttt-mcp.sh
-sh /tmp/install-ttt-mcp.sh v0.1.0
+curl -fsSL https://raw.githubusercontent.com/eugenioenko/ttt-mcp/v0.2.0/install.sh -o /tmp/install-ttt-mcp.sh
+sh /tmp/install-ttt-mcp.sh v0.2.0
 ```
 
 The installer verifies the binary's SHA-256 checksum, installs it to `~/.local/bin`, and installs the embedded Lua plugin. Set `INSTALL_DIR` to choose another binary directory. Ensure that directory is on PATH for both ttt and your agent.
@@ -35,7 +35,9 @@ To install manually instead, download the binary for your platform (for example 
 
 On Windows, download `ttt-mcp-windows-amd64.exe` from [Releases](https://github.com/eugenioenko/ttt-mcp/releases), rename it to `ttt-mcp.exe`, place it on PATH, and run `ttt-mcp install-plugin`. The same compatibility requirements apply.
 
-Restart a compatible ttt build and approve the plugin's permissions. The status bar shows `MCP ◉` when connected, `MCP ◌` while connecting or offline, and `MCP ⚠` when the service is unavailable. Command palette entries `MCP: Connect` and `MCP: Disconnect` control participation; disconnect stays off until explicitly reconnected or the plugin reloads.
+Restart ttt and approve the plugin's permissions. The status bar shows `MCP ◉` when connected, `MCP ◌` while connecting or offline, and `MCP ⚠` when the service is unavailable. Command palette entries `MCP: Connect` and `MCP: Disconnect` control participation; disconnect stays off until explicitly reconnected or the plugin reloads.
+
+To upgrade, rerun the installer (or `ttt-mcp install-plugin` with the new binary), restart ttt, and approve any new permissions. v0.2.0 adds `editor.decorations` and `panel.drawer`.
 
 `install-plugin --dir PATH` writes the two plugin files to a chosen directory. By default it uses `${TTT_CONFIG_DIR:-~/.config/ttt}/plugins/ttt-mcp`. The binary embeds the Lua source and manifest, so no separate plugin download is needed.
 
@@ -55,6 +57,12 @@ Configure a stdio MCP server using the executable on PATH:
     }
   }
 }
+```
+
+For Claude Code:
+
+```sh
+claude mcp add ttt -- ttt-mcp
 ```
 
 The stdio process bridges to the shared service; each agent can launch its own. Only MCP messages go to stdout. No client-specific configuration is edited automatically.
@@ -84,7 +92,7 @@ Try asking your agent: “List my open ttt sessions, select the workspace I name
 | `run_actions` | Run up to 256 ordered actions without another agent interleaving. |
 | `run_script` | Run the editor's `--exec`/`--listen` action syntax over plugin RPC. |
 | `wait_for` | Wait for screen text rather than guessing a delay. |
-| `list_api` / `call_api` | Discover/call public `ttt`, `ttt.editor`, and `ttt.terminal` functions with JSON arguments. |
+| `list_api` / `call_api` | Discover/call `ttt`, `ttt.editor`, `ttt.terminal`, `ttt.decorations` and `mcp.drawer` functions with JSON arguments. |
 | `read_events` | Poll file/editor/session events using a cursor. |
 
 For example, `run_actions` can paste, save, and capture the result:
@@ -105,6 +113,34 @@ Supported action names: `session`, `commands`, `command` (ID), `exec` (title), `
 `run_script` supports semicolon-separated actions with the same basic splitting rule as the editor harness. Set `separator` when literal text contains semicolons, or prefer `run_actions` for structured input. For example: `type hello; key enter; type world; key ctrl+s; screenshot`. `screenshot` and `debug` return directly; an optional path also writes through the plugin's scoped filesystem. Script execution stops at the first error or shutdown request. Waits are limited to 30 seconds per action; `wait-for` defaults to five seconds and accepts `timeout=MS`.
 
 `call_api` accepts a module, function name and positional `args` array. For example, `{"module":"ttt.editor","function":"replace","args":[1,1,1,6,"hello"]}` performs an undoable edit. Callbacks, Lua source, panel render functions, and other Lua function values cannot be passed over JSON. The complete API reference is in [ttt's plugin authoring guide](https://github.com/eugenioenko/ttt/blob/main/docs-web/src/content/docs/guides/plugin-authoring.md).
+
+### Decorations
+
+`ttt.decorations` highlights lines in a file and can draw a note under them. `set` takes a path and a list of `{line, end_line?, col?, end_col?, style?, note?}` ranges with one-based lines and columns; `clear` takes an optional path:
+
+```json
+{"module": "ttt.decorations", "function": "set", "args": ["/abs/path/main.go", [{"line": 12, "end_line": 14, "note": "Retries are capped here"}]]}
+```
+
+### Drawer
+
+`mcp.drawer` opens a side panel built from a JSON widget spec, so an agent can show status, forms or choices. `open(spec)` opens it, `update(spec)` re-renders the open drawer and `close()` closes it:
+
+```json
+{"module": "mcp.drawer", "function": "open", "args": [{"side": "right", "width": 44, "children": [
+  {"type": "title", "value": "Deploy"},
+  {"type": "keyvalue", "items": [{"key": "Branch", "value": "main"}]},
+  {"type": "checkbox", "id": "dry", "label": "Dry run", "checked": true},
+  {"type": "input", "id": "note", "placeholder": "Release note"},
+  {"type": "button", "id": "go", "label": "Go"}
+]}]}
+```
+
+Each node has a `type` plus that widget's fields from ttt's [widget API](https://github.com/eugenioenko/ttt/blob/main/docs-web/src/content/docs/guides/plugin-authoring.md#widget-api): `label`, `title`, `markdown`, `keyvalue` (`items`), `tree`, `list`, `table`, `button`, `checkbox`, `input`, `dropdown`, `progress`, `divider`, and the containers `vstack`, `hstack`, `scrollview` and `box`, which take `children`. `label`, `title` and `markdown` also accept a plain string in `value`. Raw `text` (`x, y, text, style`) and `cell` (`x, y, char, style`) nodes are positioned relative to the drawer and are allowed only at the top level. `open` and `update` reject an invalid spec with the path of the bad node.
+
+Widget callbacks arrive through `read_events` as `drawer.on_click`, `drawer.on_change`, `drawer.on_submit`, `drawer.on_select`, `drawer.on_expand`, `drawer.on_command` and `drawer.on_menu`, with data `{id, type, args}`; give nodes an `id` to tell them apart. Set `events` on a node, such as `["on_click"]`, to choose which callbacks it sends. Without it, a node sends all of them except input `on_change`, which fires on every keystroke. A checkbox keeps its toggled state until the next `open` or `update`, and `update` keeps input text and other widget state by position. If the user dismisses the drawer, no event is sent and `update` keeps succeeding until the next `open` or `close`.
+
+### Terminals
 
 To address a terminal explicitly, call `call_api` with `module: "ttt.terminal"`, `function: "list"`, and `args: []`, then call `send` with `args: ["<terminal ID>", "hello world"]`. No newline means Enter is not pressed. General typing/key tools send input to the focused widget; explicit terminal IDs avoid ambiguity. Some development builds report terminal focus as `other` ([ttt#1059](https://github.com/eugenioenko/ttt/issues/1059)).
 
@@ -131,7 +167,7 @@ The service uses `~/.cache/ttt-mcp/hub.sock` on Linux/macOS and `127.0.0.1:4251`
 - **No sessions:** check the ttt build requirements, plugin approval, and that `ttt-mcp` is on the editor's PATH. Reload the plugin after changing its files. Check ttt's OUTPUT panel for `ttt-mcp` messages.
 - **Several sessions:** call `list_sessions` and supply the desired `session_id`; the server deliberately refuses to guess.
 - **Service unavailable:** inspect `~/.cache/ttt-mcp/service.log` or run `ttt-mcp service run` in a terminal. Editors reconnect automatically after a restart.
-- **Unknown module `ttt.automation`:** the editor build lacks the required API. Installing the companion alone does not add core editor APIs.
+- **Unknown module `ttt.automation` or `ttt.rpc`:** the editor is older than v1.9.0. Upgrade ttt; installing the companion alone does not add core editor APIs.
 
 ## Build from source
 
@@ -146,26 +182,12 @@ install -m 755 bin/ttt-mcp "$HOME/.local/bin/ttt-mcp"
 ttt-mcp install-plugin
 ```
 
-### Building a compatible ttt
-
-For this first companion release, the public RPC branch needs the additional automation patch. From the directory containing your `ttt-mcp` checkout, use a separate ttt checkout:
-
-```sh
-git clone --branch feat/plugin-rpc --single-branch https://github.com/eugenioenko/ttt.git ttt-rpc
-git -C ttt-rpc checkout 46078783513d0a7eacbddad0f1860c4980296b71
-git -C ttt-rpc apply ../ttt-mcp/compat/ttt-automation.patch
-make -C ttt-rpc build
-./ttt-rpc/bin/ttt
-```
-
-The pinned revision and patch have been tested together. If your ttt checkout already includes `ttt.automation`, do not apply the patch again. This compatibility step can be retired once the required APIs are released upstream.
-
 ## Tests
 
 ```sh
 make test
 make lint
-make test-editor TTT_BINARY=/absolute/path/to/compatible/ttt
+make test-editor TTT_BINARY=/absolute/path/to/ttt
 ```
 
 Unit tests cover JSON-RPC framing, bidirectional calls/cancellation, authenticated session discovery/routing, ambiguous and stale IDs, per-editor serialization, retained events, script parsing, and MCP tool schemas/calls through the official Go SDK. The real-editor test starts two ttt processes with separate temporary plugin configurations and drives the compiled companion over MCP stdio. It verifies discovery, target isolation, Unicode paste/save/undo, commands, Lua API edits, mouse input, snapshots, events, and disconnect cleanup. It never uses `--listen` or your real ttt settings.

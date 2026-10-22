@@ -1,6 +1,6 @@
 {
   "name": "ttt-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Discover and control running ttt editors through MCP.",
   "entry": "init.lua",
   "permissions": {
