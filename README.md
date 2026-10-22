@@ -31,6 +31,8 @@ sh /tmp/install-ttt-mcp.sh v0.1.0
 
 The installer verifies the binary's SHA-256 checksum, installs it to `~/.local/bin`, and installs the embedded Lua plugin. Set `INSTALL_DIR` to choose another binary directory. Ensure that directory is on PATH for both ttt and your agent.
 
+To install manually instead, download the binary for your platform (for example `ttt-mcp-linux-amd64` or `ttt-mcp-darwin-arm64`) from the [Releases page](https://github.com/eugenioenko/ttt-mcp/releases), verify it against `checksums.txt`, rename it to `ttt-mcp`, make it executable, place it on PATH, and run `ttt-mcp install-plugin`.
+
 On Windows, download `ttt-mcp-windows-amd64.exe` from [Releases](https://github.com/eugenioenko/ttt-mcp/releases), rename it to `ttt-mcp.exe`, place it on PATH, and run `ttt-mcp install-plugin`. The same compatibility requirements apply.
 
 Restart a compatible ttt build and approve the plugin's permissions. The status bar shows `MCP ◉` when connected, `MCP ◌` while connecting or offline, and `MCP ⚠` when the service is unavailable. Command palette entries `MCP: Connect` and `MCP: Disconnect` control participation; disconnect stays off until explicitly reconnected or the plugin reloads.
