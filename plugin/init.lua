@@ -9,9 +9,122 @@ local automation = require("ttt.automation")
 local conn, connecting, stopped = nil, false, false
 local pending = {}
 local generation = 0
+local drawer_spec, drawer_panel, drawer_open
+local callbacks = { "on_click", "on_change", "on_submit", "on_select", "on_expand", "on_command", "on_menu" }
+local containers = { vstack = true, hstack = true, scrollview = true, box = true }
+local widgets = {
+  label = true, title = true, keyvalue = true, tree = true, list = true, button = true, checkbox = true,
+  input = true, vstack = true, hstack = true, scrollview = true, box = true, divider = true, dropdown = true,
+  progress = true, table = true, markdown = true,
+}
+local raw = { text = true, cell = true }
+
+local function emit_widget(node, cb, ...)
+  if not conn then return end
+  conn:notify("editor/event", { name = "drawer." .. cb, data = { id = node.id, type = node.type, args = { ... } } })
+end
+
+local function wants(node, cb)
+  if node.events == nil then return not (node.type == "input" and cb == "on_change") end
+  for _, name in ipairs(node.events) do
+    if name == cb then return true end
+  end
+  return false
+end
+
+local function validate(nodes, path, top)
+  if nodes == nil then return end
+  if type(nodes) ~= "table" then error(path .. " must be an array") end
+  for i, node in ipairs(nodes) do
+    local at = path .. "[" .. i .. "]"
+    if type(node) ~= "table" then error(at .. " must be a table") end
+    local kind = node.type
+    if raw[kind] then
+      if not top then error(at .. ": " .. kind .. " is only allowed at the top level") end
+      if type(node.x) ~= "number" or type(node.y) ~= "number" then error(at .. ": x and y must be numbers") end
+    elseif not widgets[kind] then
+      error(at .. ": unknown widget type " .. tostring(kind))
+    end
+    if node.events ~= nil then
+      if type(node.events) ~= "table" then error(at .. ".events must be an array") end
+      for _, name in ipairs(node.events) do
+        local known = false
+        for _, cb in ipairs(callbacks) do known = known or cb == name end
+        if not known then error(at .. ": unknown event " .. tostring(name)) end
+      end
+    end
+    if containers[kind] then validate(node.children, at .. ".children", false) end
+  end
+end
+
+local function build(panel, nodes)
+  for _, node in ipairs(nodes or {}) do
+    local kind = node.type
+    if raw[kind] then
+      panel[kind](panel, node.x, node.y, node.text or node.char, node.style)
+    elseif kind == "divider" then
+      panel:divider()
+    elseif type(node.value) == "string" and (kind == "label" or kind == "title" or kind == "markdown") then
+      panel[kind](panel, node.value)
+    else
+      local cfg = {}
+      for k, v in pairs(kind == "keyvalue" and (node.items or {}) or node) do cfg[k] = v end
+      if kind == "keyvalue" then
+        for k, v in pairs(node) do
+          if k:match("^margin_") or k:match("^padding_") then cfg[k] = v end
+        end
+      else
+        cfg.type, cfg.children, cfg.events = nil, nil, nil
+      end
+      for _, cb in ipairs(callbacks) do
+        if wants(node, cb) then cfg[cb] = function(...) emit_widget(node, cb, ...) end end
+      end
+      if kind == "checkbox" then
+        cfg.on_change = function(checked)
+          node.checked = checked
+          if wants(node, "on_change") then emit_widget(node, "on_change", checked) end
+        end
+      end
+      if containers[kind] then
+        cfg.render = function(child) build(child, node.children) end
+      end
+      panel[kind](panel, cfg)
+    end
+  end
+end
+
+local function check_spec(spec)
+  if type(spec) ~= "table" then error("spec must be a table") end
+  validate(spec.children, "children", true)
+end
+
+local drawer = {
+  open = function(spec)
+    check_spec(spec)
+    drawer_spec, drawer_panel, drawer_open = spec, nil, true
+    ttt.open_drawer({
+      width = spec.width, min_width = spec.min_width, side = spec.side,
+      render = function(panel)
+        drawer_panel = panel
+        if drawer_spec then build(panel, drawer_spec.children) end
+      end,
+    })
+  end,
+  update = function(spec)
+    if not drawer_open then error("no drawer open") end
+    check_spec(spec)
+    drawer_spec = spec
+    if drawer_panel then drawer_panel:redraw() end
+  end,
+  close = function()
+    drawer_spec, drawer_panel, drawer_open = nil, nil, false
+    ttt.close_drawer()
+  end,
+}
+
 local modules = {
   ttt = ttt, ["ttt.editor"] = require("ttt.editor"), ["ttt.terminal"] = require("ttt.terminal"),
-  ["ttt.decorations"] = require("ttt.decorations"),
+  ["ttt.decorations"] = require("ttt.decorations"), ["mcp.drawer"] = drawer,
 }
 local signatures = {
   ["ttt.editor"] = {
@@ -30,6 +143,17 @@ local signatures = {
     spawn = "({shell, args?, cwd?, label?, env?}) -> id, err", send = "(id, text) -> ok, err",
     focus = "(id) -> ok, err", close = "(id) -> ok, err", read = "(id, max_bytes?) -> text, err",
     screen = "(id) -> table, err", list = "() -> table[]",
+  },
+  ["mcp.drawer"] = {
+    open = "({width?, min_width?, side?, children: node[]}); node = {type, id?, events?, children?, ...widget fields}; "
+      .. "type: label, title, markdown (value=string or text=, style=...), keyvalue{items}, tree, list, button, "
+      .. "checkbox, input, dropdown, progress, table, divider, containers vstack/hstack/scrollview/box (children), "
+      .. "top-level only: text{x,y,text,style}, cell{x,y,char,style} (x,y relative to the drawer); "
+      .. "events limits callbacks (on_click, on_change, on_submit, on_select, on_expand, on_command, on_menu), "
+      .. "default all except input on_change; callbacks arrive as drawer.<callback> events with {id, type, args}; "
+      .. "checkbox state is kept until the next open/update; the user may dismiss the drawer without an event",
+    update = "(spec) re-render the open drawer with a new spec; widget state is kept by position",
+    close = "()",
   },
   ["ttt.decorations"] = {
     set = "(path, {line, end_line?, col?, end_col?, style?, note?}[])", clear = "(path?)",

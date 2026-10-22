@@ -8,6 +8,7 @@
     "editor.read": true,
     "editor.write": true,
     "editor.decorations": true,
+    "panel.drawer": true,
     "input": true,
     "screen.read": true,
     "clipboard.read": true,
