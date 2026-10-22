@@ -78,7 +78,7 @@ func TestRealEditorsOverMCP(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(pluginDir, "init.lua"), source, 0644); err != nil {
 			t.Fatal(err)
 		}
-		registry, _ := json.Marshal([]any{map[string]any{"name": "ttt-mcp", "version": "0.1.0", "enabled": true, "permissions": permissions, "grantsVersion": 2}})
+		registry, _ := json.Marshal([]any{map[string]any{"name": "ttt-mcp", "version": manifest["version"], "enabled": true, "permissions": permissions, "grantsVersion": 2}})
 		if err := os.WriteFile(filepath.Join(config, "plugins.ttt.json"), registry, 0644); err != nil {
 			t.Fatal(err)
 		}
