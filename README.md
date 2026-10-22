@@ -39,7 +39,7 @@ Restart a compatible ttt build and approve the plugin's permissions. The status 
 
 Releases include Linux/macOS amd64/arm64 binaries, a Windows amd64 binary, a separate plugin archive, and `checksums.txt`.
 
-The plugin requests editor read/write, input, screen and clipboard reads, terminal access, file/editor events, workspace file access, and permission to run `ttt-mcp` and connect to its local socket. These capabilities let connected agents control the editor, including its integrated terminals. The plugin never approves another plugin's permissions.
+The plugin requests editor read/write, input, screen and clipboard reads, a drawer panel, terminal access, file/editor events, workspace file access, and permission to run `ttt-mcp` and connect to its local socket. These capabilities let connected agents control the editor, including its integrated terminals. The plugin never approves another plugin's permissions.
 
 ## Agent configuration
 
